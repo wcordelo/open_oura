@@ -73,29 +73,33 @@ those are server-side and out of scope by design (see `docs/data-recovery-map.md
 ## Event decoding status
 
 The history-event **envelope** (tag, timestamp, type name) is fully decoded. The
-per-event **body** field layouts are produced by the ring's native
-`libringeventparser.so` and are not present in the decompiled app, so each body is
-stored **raw and lossless** and decoded opportunistically by
-`oura-core`'s `events::decode_body`. Bodies recovered so far by correlating real
-captured bytes against the protobuf field shapes (each backed by a test):
+per-event **body** layouts come from the ring's native `libringeventparser.so`,
+which was decompiled with Ghidra — every parser is a named function
+(`parse_api_temp_event`, `parse_api_hrv_event`, …), so the decoders below are
+**ports of the firmware's own logic**, not guesses (see `docs/native-decoder.md`).
+Bodies are still stored **raw and lossless**; `events::decode_body` decodes the
+ones below, and `oura redecode` backfills already-stored events when new decoders
+land. Each decoder has a unit test.
 
-| Event | Layout | Decoded as |
+| Event | Layout (from the native parser) | Decoded as |
 | --- | --- | --- |
-| `temp_event` | N× `i16` LE, centi-°C | probe temperatures (°C) — 7 on Ring 3, 3 on Ring 5; verified worn (~33 °C) |
-| `temp_period`, `sleep_temp_event` | `i16` LE, centi-°C | temperature (°C) |
-| `time_sync` | `u32` LE | unix timestamp |
-| `state_change`, `wear_event` | state byte + ASCII | state + text |
-| `debug_event`, `debug_data` | ASCII | text |
+| `temp_event` / `temp_period` / `sleep_temp` | `i16` LE / 100 | temperature °C (verified worn ~33 °C; 7 probes Ring 3, 3 Ring 5) |
+| `hrv_event` | pairs `(u8 hr, u8 rmssd)`, 5 min apart | avg HR bpm + RMSSD ms |
+| **`green_ibi_quality_event` (`0x80`)** | `ibi=(b1&7)|(b0<<3)`, `q=(b1>>3)&3` | **inter-beat intervals → heart rate** (validated: ~52 bpm resting) |
+| `ibi_and_amplitude_event` | 14-byte bit-packed | 6× IBI ms + PPG amplitude (pending real-data check) |
+| `activity_information` | state + MET bytes (`<128: ×0.1`, else `12.8+(b-128)×0.2`) | state + MET levels |
+| `spo2_event` | header + `u8` per sample | SpO2 % series |
+| `sleep_phase_*` | 2-bit codes, 4/byte | hypnogram deep/light/rem/awake |
+| `ambient` / `ehr_acm_intensity` | `u16` LE samples | raw values |
+| `time_sync` / `state_change` / `wear_event` / `alert` / debug | u32 / byte+text | as labelled |
 
-**Still raw / undecoded.** Two reasons, distinct:
+**Identified `0x80`:** it's a Ring-5 green-LED IBI stream (the native tag→type
+table is built at runtime, so it was matched by structure and confirmed against
+real bytes — coherent resting HR). So heart rate is recoverable even with the
+daytime-HR feature off.
 
-- *Native-packed, no ground truth yet:* `motion_event` (6-byte packed; proto has 9
-  fields), `activity_information` (14-byte; likely 13 MET levels + step count), and a
-  **Ring-5-only event `tag 0x80`** (frequent, ~14-byte, absent from the Ring-3 tag
-  map and not identifiable from the decompiled Java — the tag→type table is native).
-  These need correlation against ground truth or `libringeventparser.so` disassembly.
-- *Not emitted until measured:* `ibi_event`, `hrv_event`, `spo2_event`, and all
-  `sleep_*` events only appear once HR/SpO2 features are enabled (`features
-  --enable-hr --enable-spo2`) and the ring has actually measured / slept.
-
-Adding a decoder never needs a re-sync — the raw bytes are always retained.
+**Still to port** (catalogued from the `.so`, lower priority): the bit-packed
+session-stateful variants (`green_ibi_and_amp`, `spo2_ibi_and_amplitude`), the
+opaque `sleep_summary_1..4` fields, full `motion_event/period`, `real_steps`, and
+the ~40 `debug_data` statistics subtypes. Adding any of these never needs a
+re-sync — run `oura redecode`.
