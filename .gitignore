@@ -32,3 +32,6 @@ reverse/android/jadx-main/
 # Personal data exports and local working notes (kept off the repo).
 *.csv
 notes/
+
+# Playwright MCP artifacts
+.playwright-mcp/
