@@ -15,7 +15,7 @@ oura-protocol = { path = "../oura-protocol" }
 oura-link = { path = "../oura-link" }
 oura-store = { path = "../oura-store" }
 oura-analysis = { path = "../oura-analysis" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "=4.5.37", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 hex = "0.4"
