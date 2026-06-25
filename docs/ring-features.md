@@ -112,4 +112,3 @@ Key files: `…/data/device/ring/b0.smali` (`r()` enable sequence), `f2.java`
 
 After enabling a feature: wear the ring, let it run, then `oura sync` to pull the
 new events.
-</content>

@@ -207,5 +207,3 @@ What remains is **out of scope for a consumer ring**:
   (status 3 on start-none-zero) that this spike extends and confirms.
 - `crates/oura-protocol/src/protocol.rs` — `rdata` module (subtags, `DataType`).
 - `crates/oura-cli/src/main.rs` — `rdata_probe` / `rdata_sweep` harness.
-</content>
-</invoke>
