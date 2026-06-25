@@ -17,7 +17,14 @@ use oura_link::OuraClient;
 
 /// Serve the game at `127.0.0.1:port` (see [`crate::motion_server::run`]).
 pub async fn run(client: OuraClient<BleTransport>, port: u16, minutes: u16) -> Result<()> {
-    crate::motion_server::run(client, port, minutes, INDEX_HTML).await
+    crate::motion_server::run(
+        client,
+        port,
+        minutes,
+        INDEX_HTML,
+        crate::motion_server::LogOptions::default(),
+    )
+    .await
 }
 
 const INDEX_HTML: &str = r##"<!doctype html>

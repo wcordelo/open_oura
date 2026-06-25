@@ -1,7 +1,8 @@
 //! `oura` — a command-line client that reads data directly from an Oura ring over
 //! BLE, with no Oura cloud account. See `--help` for subcommands.
 
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use oura_link::OuraClient;
 
 mod game;
 mod motion_server;
+mod poc;
 mod viz;
 
 /// Read sleep/HR/activity signals straight from an Oura ring (Ring 3/4/5).
@@ -95,6 +97,27 @@ enum Command {
         /// Minutes the ring streams per "Start" (it auto-stops after this).
         #[arg(long, default_value_t = 5)]
         minutes: u16,
+    },
+    /// Berendo Labs POC: live motion visualizer + raw accelerometer JSONL logger.
+    Poc {
+        /// Local HTTP port for the POC dashboard.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Minutes the ring streams per "Start" (it auto-stops after this).
+        #[arg(long, default_value_t = 5)]
+        minutes: u16,
+        /// JSONL output path (default: `poc-<timestamp>.jsonl` in cwd).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Log raw accelerometer samples to JSONL (headless, no web UI).
+    Log {
+        /// Seconds to stream before stopping.
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+        /// JSONL output path.
+        #[arg(long, default_value = "oura-accel.jsonl")]
+        output: PathBuf,
     },
     /// Tilt-controlled asteroid game (web UI) — steer a ship by tilting the ring.
     Game {
@@ -236,6 +259,17 @@ async fn main() -> Result<()> {
         Command::Latest => cmd_latest(&cli, &key).await,
         Command::LiveHr { seconds, raw } => cmd_live_hr(&cli, &key, *seconds, *raw).await,
         Command::Accel { seconds } => cmd_accel(&cli, &key, *seconds).await,
+        Command::Poc {
+            port,
+            minutes,
+            output,
+        } => {
+            let client = connect(&cli).await?;
+            maybe_auth(&client, &key).await?;
+            let output = output.clone().unwrap_or_else(default_poc_output);
+            poc::run(client, *port, *minutes, output).await
+        }
+        Command::Log { seconds, output } => cmd_log(&cli, &key, *seconds, output).await,
         Command::SleepAnalyze { force } => cmd_sleep_analyze(&cli, &key, *force).await,
         Command::Viz { port, minutes } => {
             let client = connect(&cli).await?;
@@ -699,6 +733,64 @@ async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()
             if moved { "motion detected ✋" } else { "mostly still" }
         );
     }
+    let _ = client.transport().disconnect().await;
+    Ok(())
+}
+
+/// Default JSONL path for the Berendo Labs POC: `poc-<unix_ts>.jsonl`.
+fn default_poc_output() -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!("poc-{ts}.jsonl"))
+}
+
+/// Headless raw accelerometer logger — writes timestamped JSONL lines.
+async fn cmd_log(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, output: &Path) -> Result<()> {
+    let client = connect(cli).await?;
+    maybe_auth(&client, key).await?;
+
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(output)
+        .with_context(|| format!("opening {}", output.display()))?;
+
+    println!(
+        "Logging accelerometer to {} for {seconds}s — wave your hand!",
+        output.display()
+    );
+    let mut count = 0u64;
+    client
+        .stream_accelerometer(Duration::from_secs(seconds), |s| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let line = format!(
+                "{{\"t\":{now},\"x\":{},\"y\":{},\"z\":{}}}\n",
+                s.x, s.y, s.z
+            );
+            let _ = file.write_all(line.as_bytes());
+            count += 1;
+            if count.is_multiple_of(50) {
+                println!("  {count} samples logged…");
+            }
+        })
+        .await?;
+
+    println!(
+        "Done — {count} samples written to {}",
+        output.display()
+    );
     let _ = client.transport().disconnect().await;
     Ok(())
 }
