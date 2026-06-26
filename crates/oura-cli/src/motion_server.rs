@@ -17,13 +17,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-use oura_link::ble::BleTransport;
 use oura_link::client::AcmSample;
 use oura_protocol::protocol;
 use oura_link::transport::Transport;
 use oura_link::OuraClient;
-
-type Client = Arc<OuraClient<BleTransport>>;
 
 /// Optional JSONL logging for live accelerometer samples.
 #[derive(Clone, Default)]
@@ -40,14 +37,14 @@ struct LogState {
 
 /// Serve `index_html` at `127.0.0.1:port`. Streaming is toggled from the page;
 /// each "start" arms the ring for `minutes` (so it auto-stops if the page closes).
-pub async fn run(
-    client: OuraClient<BleTransport>,
+pub async fn run<T: Transport + 'static>(
+    client: OuraClient<T>,
     port: u16,
     minutes: u16,
     index_html: &'static str,
     log: LogOptions,
 ) -> Result<()> {
-    let client: Client = Arc::new(client);
+    let client: Arc<OuraClient<T>> = Arc::new(client);
     let (tx, _) = broadcast::channel::<String>(512);
     // Count of live SSE clients: when the last one drops (tab closed), stop the
     // ring so we don't keep streaming (and draining battery) until its timer.
@@ -143,10 +140,10 @@ fn header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-async fn handle(
+async fn handle<T: Transport + 'static>(
     mut sock: TcpStream,
     mut rx: broadcast::Receiver<String>,
-    client: Client,
+    client: Arc<OuraClient<T>>,
     clients: Arc<AtomicUsize>,
     port: u16,
     minutes: u16,
@@ -304,4 +301,151 @@ async fn not_found(sock: &mut TcpStream) -> Result<()> {
     sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use oura_link::transport::mock::MockTransport;
+    use oura_link::OuraClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn acm_frame(x: i16, y: i16, z: i16) -> Vec<u8> {
+        vec![
+            0x33, 0x0c, 0x32, 0x01,
+            (x as u8),
+            (x >> 8) as u8,
+            (y as u8),
+            (y >> 8) as u8,
+            (z as u8),
+            (z >> 8) as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    fn http_body(resp: &str) -> &str {
+        resp.split("\r\n\r\n").nth(1).unwrap_or("")
+    }
+
+    async fn http_get(host: &str, path: &str, headers: &[(&str, &str)]) -> String {
+        let mut stream = TcpStream::connect(host).await.expect("connect");
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn poc_e2e_logs_stats_sse_and_download() {
+        let mock = Arc::new(MockTransport::new());
+        let start_hex = hex::encode(protocol::req_set_realtime(protocol::realtime::ACM, 5, 0));
+        mock.on(&start_hex, &[]);
+        mock.on("060400000000", &[]);
+
+        let client = OuraClient::new(mock.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("e2e.jsonl");
+
+        let port = 19081u16;
+        let log_path_spawn = log_path.clone();
+        let server = tokio::spawn(async move {
+            let _ = run(
+                client,
+                port,
+                5,
+                "<html><body>poc</body></html>",
+                LogOptions {
+                    path: Some(log_path_spawn),
+                },
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let host = format!("127.0.0.1:{port}");
+
+        // Index page is served.
+        let index = http_get(&host, "/", &[]).await;
+        assert!(index.contains("200 OK"));
+        assert!(http_body(&index).contains("poc"));
+
+        // CSRF: /start without header is forbidden.
+        let forbidden = http_get(&host, "/start", &[]).await;
+        assert!(forbidden.contains("403"));
+
+        // Start streaming (mock transport accepts the request).
+        let origin = format!("http://{host}");
+        let started = http_get(
+            &host,
+            "/start",
+            &[("X-Oura-Viz", "1"), ("Origin", &origin)],
+        )
+        .await;
+        assert!(started.contains("200 OK"), "start: {started}");
+
+        // Inject accelerometer frames as if from the ring.
+        mock.inject_frame(acm_frame(1, 2, 1024));
+        mock.inject_frame(acm_frame(10, 20, 1030));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Stats reflect logged samples.
+        let stats_resp = http_get(&host, "/stats", &[]).await;
+        assert!(stats_resp.contains("200 OK"), "stats status: {stats_resp}");
+        let stats_body = http_body(&stats_resp);
+        let stats: serde_json::Value = serde_json::from_str(stats_body.trim()).expect("json");
+        assert_eq!(stats["samples"].as_u64(), Some(4)); // 2 frames × 2 samples each
+        assert!(stats["bytes"].as_u64().unwrap_or(0) > 0);
+
+        // SSE stream delivers JSON samples (connect first, then inject).
+        let mut stream = TcpStream::connect(&host).await.expect("sse connect");
+        stream
+            .write_all(
+                format!("GET /stream HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("sse write");
+        mock.inject_frame(acm_frame(100, 200, 1024));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.expect("sse read");
+        let sse = String::from_utf8_lossy(&buf[..n]);
+        assert!(sse.contains("text/event-stream"), "sse headers: {sse}");
+        assert!(sse.contains("\"x\":"), "sse data: {sse}");
+
+        // Download returns the JSONL file.
+        let dl = http_get(&host, "/download", &[]).await;
+        assert!(dl.contains("200 OK"), "download: {dl}");
+        let dl_body = http_body(&dl);
+        assert!(dl_body.contains("\"t\":"));
+        assert!(dl_body.contains("\"x\":1"));
+        assert!(dl_body.lines().count() >= 4);
+
+        // Stop and verify file on disk.
+        let stopped = http_get(
+            &host,
+            "/stop",
+            &[("X-Oura-Viz", "1"), ("Origin", &origin)],
+        )
+        .await;
+        assert!(stopped.contains("200 OK"));
+
+        let on_disk = fs::read_to_string(&log_path).expect("read log");
+        assert!(on_disk.contains("\"z\":1024"));
+
+        server.abort();
+    }
 }

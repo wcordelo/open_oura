@@ -22,3 +22,7 @@ hex = "0.4"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+oura-link = { path = "../oura-link", features = ["test-util"] }
+tempfile = "3"
