@@ -48,8 +48,8 @@ where
     Ok(frames)
 }
 
-#[cfg(test)]
-pub(crate) mod mock {
+#[cfg(any(test, feature = "test-util"))]
+pub mod mock {
     //! A scripted transport for unit tests: maps request hex prefixes to canned
     //! response frames.
     use super::*;
@@ -77,6 +77,11 @@ pub(crate) mod mock {
                 responses.iter().map(|h| hex::decode(h).unwrap()).collect(),
             );
         }
+
+        /// Push a notification frame into the inbound stream (for integration tests).
+        pub fn inject_frame(&self, frame: Vec<u8>) {
+            let _ = self.tx.send(frame);
+        }
     }
 
     #[async_trait]
@@ -93,6 +98,17 @@ pub(crate) mod mock {
 
         fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
             self.tx.subscribe()
+        }
+    }
+
+    #[async_trait]
+    impl Transport for std::sync::Arc<MockTransport> {
+        async fn write(&self, data: &[u8]) -> Result<()> {
+            (**self).write(data).await
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+            (**self).subscribe()
         }
     }
 }

@@ -61,6 +61,12 @@ oura --key-file key.hex live-hr --seconds 30 [--raw]
 # Live accelerometer stream - wave your hand to see motion (ACM real-time)
 oura --key-file key.hex accel --seconds 15
 
+# Berendo Labs POC: motion visualizer + raw JSONL logger (see docs/poc.md)
+oura --key-file key.hex poc   # then open http://127.0.0.1:8080
+
+# Headless raw accelerometer logger (JSONL, no web UI)
+oura --key-file key.hex log --seconds 30 --output session.jsonl
+
 # Real-time 3D motion visualizer (opens a local web UI)
 oura --key-file key.hex viz   # then open http://127.0.0.1:8088
 

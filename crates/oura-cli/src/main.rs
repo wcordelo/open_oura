@@ -12,8 +12,10 @@ use oura_link::ble::{self, BleTransport};
 use oura_store::storage::Store;
 use oura_link::OuraClient;
 
+mod accel_log;
 mod game;
 mod motion_server;
+mod poc;
 mod viz;
 
 /// Read sleep/HR/activity signals straight from an Oura ring (Ring 3/4/5).
@@ -95,6 +97,27 @@ enum Command {
         /// Minutes the ring streams per "Start" (it auto-stops after this).
         #[arg(long, default_value_t = 5)]
         minutes: u16,
+    },
+    /// Berendo Labs POC: live motion visualizer + raw accelerometer JSONL logger.
+    Poc {
+        /// Local HTTP port for the POC dashboard.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Minutes the ring streams per "Start" (it auto-stops after this).
+        #[arg(long, default_value_t = 5)]
+        minutes: u16,
+        /// JSONL output path (default: `poc-<timestamp>.jsonl` in cwd).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Log raw accelerometer samples to JSONL (headless, no web UI).
+    Log {
+        /// Seconds to stream before stopping.
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+        /// JSONL output path.
+        #[arg(long, default_value = "oura-accel.jsonl")]
+        output: PathBuf,
     },
     /// Tilt-controlled asteroid game (web UI) — steer a ship by tilting the ring.
     Game {
@@ -236,6 +259,17 @@ async fn main() -> Result<()> {
         Command::Latest => cmd_latest(&cli, &key).await,
         Command::LiveHr { seconds, raw } => cmd_live_hr(&cli, &key, *seconds, *raw).await,
         Command::Accel { seconds } => cmd_accel(&cli, &key, *seconds).await,
+        Command::Poc {
+            port,
+            minutes,
+            output,
+        } => {
+            let client = connect(&cli).await?;
+            maybe_auth(&client, &key).await?;
+            let output = output.clone().unwrap_or_else(default_poc_output);
+            poc::run(client, *port, *minutes, output).await
+        }
+        Command::Log { seconds, output } => cmd_log(&cli, &key, *seconds, output).await,
         Command::SleepAnalyze { force } => cmd_sleep_analyze(&cli, &key, *force).await,
         Command::Viz { port, minutes } => {
             let client = connect(&cli).await?;
@@ -699,6 +733,33 @@ async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()
             if moved { "motion detected ✋" } else { "mostly still" }
         );
     }
+    let _ = client.transport().disconnect().await;
+    Ok(())
+}
+
+/// Default JSONL path for the Berendo Labs POC: `poc-<unix_ts>.jsonl`.
+fn default_poc_output() -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!("poc-{ts}.jsonl"))
+}
+
+/// Headless raw accelerometer logger — writes timestamped JSONL lines.
+async fn cmd_log(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, output: &Path) -> Result<()> {
+    let client = connect(cli).await?;
+    maybe_auth(&client, key).await?;
+
+    println!(
+        "Logging accelerometer to {} for {seconds}s — wave your hand!",
+        output.display()
+    );
+    let count = accel_log::log_to_jsonl(&client, seconds, output).await?;
+    println!(
+        "Done — {count} samples written to {}",
+        output.display()
+    );
     let _ = client.transport().disconnect().await;
     Ok(())
 }
