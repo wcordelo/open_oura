@@ -163,3 +163,56 @@ $('download').onclick=()=>{location.href='/download';};
 addEventListener('pagehide',()=>{try{fetch('/stop',{headers:H.headers,keepalive:true});}catch(e){}});
 </script>
 </body></html>"##;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use oura_link::transport::mock::MockTransport;
+    use oura_link::OuraClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn dashboard_serves_berendo_labs_ui() {
+        let mock = Arc::new(MockTransport::new());
+        let client = OuraClient::new(mock);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("poc-ui.jsonl");
+        let port = 19082u16;
+
+        let server = tokio::spawn(async move {
+            let _ = crate::motion_server::run(
+                client,
+                port,
+                5,
+                super::INDEX_HTML,
+                crate::motion_server::LogOptions {
+                    path: Some(log_path),
+                },
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let host = format!("127.0.0.1:{port}");
+        let mut stream = TcpStream::connect(&host).await.expect("connect");
+        stream
+            .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        let page = String::from_utf8_lossy(&buf);
+
+        assert!(page.contains("200 OK"), "status: {page}");
+        let body = page.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.contains("Berendo Labs"));
+        assert!(body.contains("open_oura POC"));
+        assert!(body.contains("Download JSONL"));
+        assert!(body.contains("EventSource('/stream')"));
+
+        server.abort();
+    }
+}

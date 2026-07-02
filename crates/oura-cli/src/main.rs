@@ -1,8 +1,7 @@
 //! `oura` — a command-line client that reads data directly from an Oura ring over
 //! BLE, with no Oura cloud account. See `--help` for subcommands.
 
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +12,7 @@ use oura_link::ble::{self, BleTransport};
 use oura_store::storage::Store;
 use oura_link::OuraClient;
 
+mod accel_log;
 mod game;
 mod motion_server;
 mod poc;
@@ -751,42 +751,11 @@ async fn cmd_log(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, output: &Path)
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
 
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(output)
-        .with_context(|| format!("opening {}", output.display()))?;
-
     println!(
         "Logging accelerometer to {} for {seconds}s — wave your hand!",
         output.display()
     );
-    let mut count = 0u64;
-    client
-        .stream_accelerometer(Duration::from_secs(seconds), |s| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let line = format!(
-                "{{\"t\":{now},\"x\":{},\"y\":{},\"z\":{}}}\n",
-                s.x, s.y, s.z
-            );
-            let _ = file.write_all(line.as_bytes());
-            count += 1;
-            if count.is_multiple_of(50) {
-                println!("  {count} samples logged…");
-            }
-        })
-        .await?;
-
+    let count = accel_log::log_to_jsonl(&client, seconds, output).await?;
     println!(
         "Done — {count} samples written to {}",
         output.display()
